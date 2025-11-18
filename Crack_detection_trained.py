@@ -1,97 +1,123 @@
-from ultralytics import YOLO
 import cv2
+import os
+import json
 import numpy as np
+from ultralytics import YOLO
 
-# Load YOLO model
-model = YOLO(r'C:\Users\752595\best\best.pt')
+# ───── Configuration ─────
+model = YOLO(r'C:\Users\752595\best\weights_V3.pt')
+save_dir = r'C:\Users\752595\best_failed_capture'
+json_output_dir = 'json_results'
+os.makedirs(save_dir, exist_ok=True)
+os.makedirs(json_output_dir, exist_ok=True)
+CONFIDENCE_THRESHOLD = 0.50
+SHARPNESS_THRESHOLD = 1000
 
-# Open Vedipo Camera for real time detection 
+# ───── Video Capture ─────
 cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Could not open video.")
+    exit()
 
-# Frame and save counters
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+out = cv2.VideoWriter(
+    r'C:\Users\752595\video_failed_capture\output_video.mp4v',
+    cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height)
+)
+
 frame_count = 0
 save_count = 0
-CONFIDENCE_THRESHOLD = 0.5
- 
-# Track previous detection state
 prev_detection_state = None
 
+# ───── Utility Functions ─────
+def calculate_sharpness(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    return laplacian.var()
+
+def draw_overlay(frame, text, position, color=(255, 255, 255)):
+    cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+# ───── Main Loop ─────
 while True:
+    start_time = cv2.getTickCount()
     ret, frame = cap.read()
     if not ret:
         break
-    # Run YOLO prediction
-    results = model.predict(source=frame, imgsz=640, conf=0.25, save=False, verbose=False)
-    result = results[0]
-    boxes = result.boxes.xyxy.cpu().numpy()
-    scores = result.boxes.conf.cpu().numpy()
-    classes = result.boxes.cls.cpu().numpy()
-    class_names = result.names
- 
-    defect_detected = False
-    detection_count = len(boxes)
 
-    # Algorithm for crack detections
+    # ───── YOLO Detection ─────
+    results = model.predict(source=frame, imgsz=640, conf=0.20, save=False, verbose=False)[0]
+    boxes = results.boxes.xyxy.cpu().numpy()
+    scores = results.boxes.conf.cpu().numpy()
+    classes = results.boxes.cls.cpu().numpy()
+    class_names = results.names
+
+    defect_detected = False
     for box, score, cls_id in zip(boxes, scores, classes):
         if score < CONFIDENCE_THRESHOLD:
             continue
- 
         defect_detected = True
         x1, y1, x2, y2 = map(int, box)
- 
         label = f"{class_names[int(cls_id)]} {score:.2f}"
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 1)
-        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        draw_overlay(frame, label, (x1, y1 - 10), (0, 0, 255))
 
-    # Convert to be HSV for definde golden region of PZT
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower_gold = np.array([15, 50, 100])
-    upper_gold = np.array([35, 255, 255])
-    gold_mask = cv2.inRange(hsv, lower_gold, upper_gold)
+    # ───── Confidence & FPS ─────
+    avg_confidence = round(float(np.mean(scores)) * 100, 2) if len(scores) > 0 else 0.0
+    end_time = cv2.getTickCount()
+    time_elapsed = (end_time - start_time) / cv2.getTickFrequency()
+    fps_value = round(1.0 / time_elapsed, 2)
 
-    # Detect rectangle gray stript (by optimize range grayscale)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    lower_gray = np.array([100])
-    upper_gray = np.array([150])
-    gray_mask = cv2.inRange(gray, lower_gray, upper_gray)
+    # ───── Result Text ─────
+    if avg_confidence < 50:
+        result_text = 'Resolution Adjusting'
+        text_color = (255, 0, 0)
+        save_label = "LowConfidence"
+    elif defect_detected:
+        result_text = 'Acceptance Result: Reject'
+        text_color = (0, 0, 255)
+        save_label = "Rejected"
+    else:
+        result_text = 'Acceptance Result: Accept'
+        text_color = (0, 255, 0)
+        save_label = "Accept"
 
-    # Integrating golden mask and cut-off gray stript
-    combined_mask = cv2.bitwise_and(gold_mask, cv2.bitwise_not(gray_mask))
+    draw_overlay(frame, result_text, (10, height - 40), text_color)
+    draw_overlay(frame, f'FPS: {fps_value}', (10, height - 70), (0, 255, 255))
+    draw_overlay(frame, f'Confidence: {avg_confidence}%', (10, height - 100), (255, 255, 0))
 
-    # adjust contrast for emphersize crack region
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(gray)
+    # ───── Save Frame & JSON ─────
+    current_detection_state = {
+        'defect_detected': defect_detected,
+        'total_detections': len(boxes)
+    }
 
-    # Detect crack line by using Canny
-    edges = cv2.Canny(enhanced, 50, 150)
+    if current_detection_state != prev_detection_state:
+        save_path = os.path.join(save_dir, f'{save_label}_{frame_count:05d}.jpg')
+        cv2.imwrite(save_path, frame)
+        save_count += 1
 
-    # Using mask for reemphersize PZT crack black line over golden region
-    defect = cv2.bitwise_and(edges, edges, mask=combined_mask)
+        result_data = {
+            "frame_id": frame_count,
+            "acceptance_result": save_label,
+            "scores": round(float(np.mean(scores)), 2)
+        }
+        json_path = os.path.join(json_output_dir, f"result_{frame_count:05d}.json")
+        with open(json_path, 'w') as f:
+            json.dump(result_data, f, indent=4)
 
-    # Identification the contour of verifcle  rectangle 
-    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > 5000:  # filter out the small region
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect_ratio = w / float(h)
-            if 0.28 < aspect_ratio < 0.95 and h > w:  # Detect rectangle in vertical plan 
-                # Covers a rectangular area
-                roi = defect[y:y+h, x:x+w]
-                roi_contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                for rc in roi_contours:
-                    if cv2.contourArea(rc) > 100:  # Filter out small crack area
-                        rc += [x, y]  # Adjust contour coordinates
-                        #cv2.drawContours(frame, [rc], -1, (0, 0, 255), 2)
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        prev_detection_state = current_detection_state
 
-    # Display the result 
     cv2.imshow('u-PZT Crack Defect Detection', frame)
 
-    # Exit the program by pressing 'q'
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
+    frame_count += 1
 
-# Close camera and window
+# ───── Cleanup ─────
 cap.release()
 cv2.destroyAllWindows()
+print(f"\nTotal frames saved: {save_count}")
